@@ -18,7 +18,6 @@ function normalizePrivateKey(raw = "") {
 }
 
 function loadCredentials() {
-  // Preferred method: Render Secret File
   if (fs.existsSync(SECRET_FILE_PATH)) {
     const raw = fs.readFileSync(SECRET_FILE_PATH, "utf8");
     const obj = JSON.parse(raw);
@@ -33,35 +32,12 @@ function loadCredentials() {
       client_email: obj.client_email.trim(),
       private_key: normalizePrivateKey(obj.private_key),
       source: "secret_file",
+      project_id: obj.project_id || null,
     };
   }
 
-  // Optional fallback: base64 encoded full service-account JSON
-  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
-    const decoded = Buffer.from(
-      process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64.trim(),
-      "base64"
-    ).toString("utf8");
-
-    const obj = JSON.parse(decoded);
-    if (!obj.client_email || !obj.private_key) {
-      throw new Error(
-        "GOOGLE_SERVICE_ACCOUNT_JSON_B64 is missing client_email/private_key"
-      );
-    }
-
-    return {
-      client_email: obj.client_email.trim(),
-      private_key: normalizePrivateKey(obj.private_key),
-      source: "base64_env",
-    };
-  }
-
-  // Final fallback: separate environment variables
   const client_email = (process.env.GOOGLE_CLIENT_EMAIL || "").trim();
-  const private_key = normalizePrivateKey(
-    process.env.GOOGLE_PRIVATE_KEY || ""
-  );
+  const private_key = normalizePrivateKey(process.env.GOOGLE_PRIVATE_KEY || "");
 
   if (!client_email || !private_key) {
     throw new Error(
@@ -73,6 +49,7 @@ function loadCredentials() {
     client_email,
     private_key,
     source: "separate_env",
+    project_id: null,
   };
 }
 
@@ -88,49 +65,100 @@ function validateCredentials(creds) {
   return creds;
 }
 
-function searchConsole() {
+function getAuth() {
   const creds = validateCredentials(loadCredentials());
+  return {
+    creds,
+    auth: new google.auth.GoogleAuth({
+      credentials: {
+        client_email: creds.client_email,
+        private_key: creds.private_key,
+      },
+      scopes: ["https://www.googleapis.com/auth/webmasters.readonly"],
+    }),
+  };
+}
 
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: creds.client_email,
-      private_key: creds.private_key,
-    },
-    scopes: ["https://www.googleapis.com/auth/webmasters.readonly"],
-  });
-
-  return google.searchconsole({
-    version: "v1",
-    auth,
-  });
+function getSearchConsole() {
+  const { auth } = getAuth();
+  return google.searchconsole({ version: "v1", auth });
 }
 
 function jsonText(value) {
   return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(value, null, 2),
-      },
-    ],
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
   };
+}
+
+function safeError(error, stage) {
+  const response = error?.response;
+  const data = response?.data;
+
+  return {
+    ok: false,
+    stage,
+    name: error?.name || null,
+    message: error?.message || "Unknown error",
+    httpStatus: response?.status || error?.code || null,
+    googleError: data?.error || data || null,
+  };
+}
+
+async function safeTool(stage, fn) {
+  try {
+    const result = await fn();
+    return jsonText({ ok: true, stage, ...result });
+  } catch (error) {
+    console.error(`[${stage}]`, error);
+    return jsonText(safeError(error, stage));
+  }
 }
 
 function makeServer() {
   const server = new McpServer({
     name: "supercape-gsc-mcp",
-    version: "2.2.0",
+    version: "2.3.0",
   });
+
+  server.tool(
+    "gsc_diagnose",
+    "Diagnose Google Search Console authentication and API access without exposing secrets.",
+    {},
+    async () =>
+      safeTool("diagnose", async () => {
+        const { creds, auth } = getAuth();
+
+        // Forces token acquisition, separating auth failures from API failures.
+        const client = await auth.getClient();
+        const token = await client.getAccessToken();
+
+        const gsc = google.searchconsole({ version: "v1", auth });
+        const sites = await gsc.sites.list();
+
+        return {
+          credentialSource: creds.source,
+          projectId: creds.project_id,
+          clientEmail: creds.client_email,
+          accessTokenObtained: Boolean(token?.token),
+          siteCount: sites.data.siteEntry?.length || 0,
+          sites: sites.data.siteEntry || [],
+        };
+      })
+  );
 
   server.tool(
     "gsc_list_sites",
     "List Google Search Console properties accessible to the configured service account.",
     {},
-    async () => {
-      const gsc = searchConsole();
-      const response = await gsc.sites.list();
-      return jsonText(response.data);
-    }
+    async () =>
+      safeTool("list_sites", async () => {
+        const gsc = getSearchConsole();
+        const response = await gsc.sites.list();
+        return {
+          siteCount: response.data.siteEntry?.length || 0,
+          sites: response.data.siteEntry || [],
+        };
+      })
   );
 
   server.tool(
@@ -154,21 +182,15 @@ function makeServer() {
       rowLimit: z.number().int().min(1).max(25000).default(100),
       siteUrl: z.string().optional(),
     },
-    async ({ startDate, endDate, dimensions, rowLimit, siteUrl }) => {
-      const gsc = searchConsole();
-
-      const response = await gsc.searchanalytics.query({
-        siteUrl: siteUrl || SITE_URL,
-        requestBody: {
-          startDate,
-          endDate,
-          dimensions,
-          rowLimit,
-        },
-      });
-
-      return jsonText(response.data);
-    }
+    async ({ startDate, endDate, dimensions, rowLimit, siteUrl }) =>
+      safeTool("search_analytics", async () => {
+        const gsc = getSearchConsole();
+        const response = await gsc.searchanalytics.query({
+          siteUrl: siteUrl || SITE_URL,
+          requestBody: { startDate, endDate, dimensions, rowLimit },
+        });
+        return { siteUrl: siteUrl || SITE_URL, data: response.data };
+      })
   );
 
   server.tool(
@@ -189,37 +211,35 @@ function makeServer() {
       minPosition,
       maxPosition,
       limit,
-    }) => {
-      const gsc = searchConsole();
+    }) =>
+      safeTool("top_opportunities", async () => {
+        const gsc = getSearchConsole();
+        const response = await gsc.searchanalytics.query({
+          siteUrl: SITE_URL,
+          requestBody: {
+            startDate,
+            endDate,
+            dimensions: ["query", "page"],
+            rowLimit: 25000,
+          },
+        });
 
-      const response = await gsc.searchanalytics.query({
-        siteUrl: SITE_URL,
-        requestBody: {
-          startDate,
-          endDate,
-          dimensions: ["query", "page"],
-          rowLimit: 25000,
-        },
-      });
+        const rows = (response.data.rows || [])
+          .filter(
+            (row) =>
+              (row.impressions || 0) >= minImpressions &&
+              (row.position || 0) >= minPosition &&
+              (row.position || 0) <= maxPosition
+          )
+          .sort((a, b) => (b.impressions || 0) - (a.impressions || 0))
+          .slice(0, limit);
 
-      const rows = (response.data.rows || [])
-        .filter(
-          (row) =>
-            (row.impressions || 0) >= minImpressions &&
-            (row.position || 0) >= minPosition &&
-            (row.position || 0) <= maxPosition
-        )
-        .sort(
-          (a, b) => (b.impressions || 0) - (a.impressions || 0)
-        )
-        .slice(0, limit);
-
-      return jsonText({
-        siteUrl: SITE_URL,
-        count: rows.length,
-        rows,
-      });
-    }
+        return {
+          siteUrl: SITE_URL,
+          count: rows.length,
+          rows,
+        };
+      })
   );
 
   return server;
@@ -232,37 +252,32 @@ app.get("/", (_req, res) => {
   res.json({
     service: "SuperCape Google Search Console MCP",
     status: "ok",
-    version: "2.2.0",
+    version: "2.3.0",
     mcp: "/mcp",
     site: SITE_URL,
   });
 });
 
-app.get("/health", (_req, res) => {
+app.get("/health", async (_req, res) => {
   try {
     const creds = validateCredentials(loadCredentials());
+    const { auth } = getAuth();
+    const client = await auth.getClient();
+    const token = await client.getAccessToken();
 
     res.json({
       ok: true,
-      version: "2.2.0",
-      credentialsConfigured: true,
+      version: "2.3.0",
       credentialSource: creds.source,
       secretFileFound: fs.existsSync(SECRET_FILE_PATH),
-      clientEmailConfigured: Boolean(creds.client_email),
-      privateKeyLooksValid:
-        creds.private_key.startsWith("-----BEGIN PRIVATE KEY-----") &&
-        creds.private_key.endsWith("-----END PRIVATE KEY-----"),
+      clientEmail: creds.client_email,
+      projectId: creds.project_id,
+      privateKeyLooksValid: true,
+      accessTokenObtained: Boolean(token?.token),
       site: SITE_URL,
     });
   } catch (error) {
-    res.status(500).json({
-      ok: false,
-      version: "2.2.0",
-      credentialsConfigured: false,
-      secretFileFound: fs.existsSync(SECRET_FILE_PATH),
-      error: error.message,
-      site: SITE_URL,
-    });
+    res.status(500).json(safeError(error, "health"));
   }
 });
 
@@ -273,11 +288,7 @@ app.post("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
 
     if (sessionId && transports[sessionId]) {
-      return await transports[sessionId].handleRequest(
-        req,
-        res,
-        req.body
-      );
+      return await transports[sessionId].handleRequest(req, res, req.body);
     }
 
     if (!sessionId && isInitializeRequest(req.body)) {
@@ -289,56 +300,41 @@ app.post("/mcp", async (req, res) => {
       });
 
       transport.onclose = () => {
-        if (transport.sessionId) {
-          delete transports[transport.sessionId];
-        }
+        if (transport.sessionId) delete transports[transport.sessionId];
       };
 
       const server = makeServer();
       await server.connect(transport);
-
       return await transport.handleRequest(req, res, req.body);
     }
 
     res.status(400).json({
       jsonrpc: "2.0",
-      error: {
-        code: -32000,
-        message: "Bad Request: missing/invalid MCP session",
-      },
+      error: { code: -32000, message: "Bad Request: missing/invalid MCP session" },
       id: null,
     });
   } catch (error) {
-    console.error(error);
-
-    if (!res.headersSent) {
-      res.status(500).json({
-        error: error.message,
-      });
-    }
+    console.error("[mcp_transport]", error);
+    if (!res.headersSent) res.status(500).json(safeError(error, "mcp_transport"));
   }
 });
 
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
-
   if (!sessionId || !transports[sessionId]) {
     return res.status(400).send("Invalid MCP session");
   }
-
   await transports[sessionId].handleRequest(req, res);
 });
 
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
-
   if (!sessionId || !transports[sessionId]) {
     return res.status(400).send("Invalid MCP session");
   }
-
   await transports[sessionId].handleRequest(req, res);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`SuperCape GSC MCP v2.2.0 listening on port ${PORT}`);
+  console.log(`SuperCape GSC MCP v2.3.0 listening on port ${PORT}`);
 });
